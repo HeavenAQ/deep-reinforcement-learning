@@ -6,12 +6,15 @@ readme = "README.md"
 authors = [{ name = "Chen Yi Min", email = "891118heaven@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [
-    "gymnasium>=1.4.0",
+    "gymnasium[classic-control,other]>=1.4.0",
+    "torch>=2.15.0",
 ]
 
 [project.scripts]
 rl = "rl:main"
-basics-gym = "rl.basics:main"
+basics-single-env = "rl.basics.main:single_env"
+basics-multi-envs = "rl.basics.main:multi_env"
+basics-q-learning = "rl.basics.main:q_learning"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]
