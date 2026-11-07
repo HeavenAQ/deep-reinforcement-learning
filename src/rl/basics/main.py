@@ -1,88 +1,53 @@
+"""Q-learning and DQN on CartPole with a small MLP Q-network.
+
+- `q_learning`: one online TD(0) update per step on the latest transitions,
+  bootstrapping from the Q-network itself.
+- `dqn`: adds an experience replay buffer and a periodically synced target network.
+"""
+
+import copy
 import logging
-import time
+from dataclasses import dataclass
 
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from gymnasium.wrappers import RecordVideo
 
+from rl.basics.envs import ENV_ID, VIDEO_DIR, make_vector_env
+from rl.basics.stats import TrainingStats
 from rl.commons import utils
-
-ENV_ID = "CartPole-v1"
-VIDEO_DIR = "videos"
-VIDEO_STEP_INTERVAL = 1_000
 
 logger = logging.getLogger(__name__)
 
 
-def create_single_env(recording: bool):
-    env = gym.make(ENV_ID, render_mode="rgb_array")
-    if recording:
-        env = gym.wrappers.RecordVideo(env, VIDEO_DIR)
-    obs, info = env.reset()
-    return env, obs, info
+@dataclass
+class QLearningConfig:
+    name: str = "q_learning"
+    num_envs: int = 3
+    seed: int | None = None
+    capture_video: bool = True
+    time_steps: int = 100_000
+    lr: float = 1e-4
+    gamma: float = 0.99
+    eps_start: float = 1.0
+    eps_end: float = 0.05
+    exploration_fraction: float = 0.5  # fraction of time_steps over which eps decays
+    log_interval: int = 1_000
+    return_window: int = 20
 
 
-def make_env(capture_video: bool = False, seed: int | None = None):
-    env = gym.make(ENV_ID, render_mode="rgb_array")
-    if capture_video:
-        env = gym.wrappers.RecordVideo(
-            env,
-            VIDEO_DIR,
-            # start a new recording every VIDEO_STEP_INTERVAL env steps
-            step_trigger=lambda step: step % VIDEO_STEP_INTERVAL == 0,
-        )
-    env = gym.wrappers.RecordEpisodeStatistics(env)
-    if seed is not None:
-        env.action_space.seed(seed)
-    return env
-
-
-def create_multi_envs(n_vecs: int):
-    return gym.vector.SyncVectorEnv([make_env for _ in range(n_vecs)])
-
-
-def single_env():
-    recording = True
-    env, obs, info = create_single_env(recording)
-
-    print("obs:", obs)
-    print("info:", info)
-
-    if recording and isinstance(env, RecordVideo):
-        print("Video folder:", env.video_folder)
-        print("Recording status:", env.recording)
-
-    G = 0
-    # terminated = one episode done
-    terminated, truncated = False, False
-    while not (terminated or truncated):
-        action = env.action_space.sample()
-        _, reward, terminated, truncated, _ = env.step(action)
-        G += reward
-
-    env.close()
-    print(G)
-
-
-def multi_env():
-    envs = create_multi_envs(3)
-    envs.reset()
-
-    terminated, truncated = False, False
-    while not (terminated or truncated):
-        actions = envs.action_space.sample()
-        next_obs, rewards, terminateds, truncateds, infos = envs.step(actions)
-
-        # stop when the first environment terminates
-        # auto-reset is called for the other environment that terminates earlier than the first one
-        truncated = truncateds[0]
-        terminated = terminateds[0]
-        print(next_obs, rewards, terminateds, truncateds, infos)
-
-    envs.close()
+@dataclass
+class DQNConfig(QLearningConfig):
+    name: str = "dqn"
+    time_steps: int = 50_000
+    lr: float = 2.5e-4
+    buffer_size: int = 10_000
+    batch_size: int = 128
+    learning_starts: int = 1_000  # steps of pure collection before training
+    train_frequency: int = 1  # one gradient update every n steps
+    target_update_interval: int = 500  # steps between target network syncs
 
 
 class QNetwork(nn.Module):
@@ -91,7 +56,7 @@ class QNetwork(nn.Module):
         n_obs = int(np.array(env.single_observation_space.shape).prod())
         action_space = env.single_action_space
         assert isinstance(action_space, gym.spaces.Discrete)
-        n_actions = action_space.n
+        n_actions = int(action_space.n)
 
         self.network = nn.Sequential(
             nn.Linear(n_obs, n_hidden),
@@ -107,132 +72,146 @@ def linear_schedule(start: float, end: float, duration: float, t: int) -> float:
     return max(end, start - (start - end) * t / duration)
 
 
-def fmt_mean(values, precision: int = 2) -> str:
-    return f"{np.mean(values):.{precision}f}" if len(values) else "n/a"
+def select_actions(
+    q_network: QNetwork, obs: torch.Tensor, eps: float, action_space: gym.Space
+) -> np.ndarray:
+    """Epsilon-greedy, decided independently for each env."""
+    with torch.no_grad():
+        greedy_actions = q_network(obs).argmax(dim=1).cpu().numpy()
+    explore = np.random.random(len(greedy_actions)) < eps
+    return np.where(explore, action_space.sample(), greedy_actions)
 
 
-def q_learning():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+def td_loss(
+    q_network: QNetwork,
+    target_network: QNetwork,
+    batch: tuple[torch.Tensor, ...],
+    gamma: float,
+) -> torch.Tensor:
+    obs, actions, rewards, next_obs, terminateds = batch
+    q = q_network(obs).gather(1, actions.unsqueeze(1)).squeeze(1)
+    with torch.no_grad():
+        next_q = target_network(next_obs).max(dim=1).values
+        target = rewards + gamma * (1 - terminateds) * next_q
+    return nn.functional.mse_loss(q, target)
 
-    # parameters
-    num_envs = 3
-    seed = None
-    capture_video = True
-    lr = 1e-4
-    eps_start = 1.0
-    eps_end = 0.05
-    exploration_fraction = 0.5  # fraction of time_steps over which eps decays
-    time_steps = 100_000
-    gamma = 0.99
-    log_interval = 1_000
-    return_window = 20
 
-    # initialization
+def train(cfg: QLearningConfig) -> QNetwork:
     device = torch.accelerator.current_accelerator(
         check_available=True
     ) or torch.device("cpu")
-    envs = gym.vector.SyncVectorEnv(
-        [
-            # bind i at definition time; only record video for the first env
-            lambda i=i: make_env(
-                capture_video and i == 0, None if seed is None else seed + i
-            )
-            for i in range(num_envs)
-        ]
+    envs = make_vector_env(
+        cfg.num_envs, cfg.seed, cfg.capture_video, f"{VIDEO_DIR}/{cfg.name}"
     )
     q_network = QNetwork(envs).to(device)
-    optimizer = optim.AdamW(q_network.parameters(), lr=lr)
+    optimizer = optim.AdamW(q_network.parameters(), lr=cfg.lr)
 
-    def to_tensor(x, dtype=torch.float32) -> torch.Tensor:
-        return torch.as_tensor(x, dtype=dtype, device=device)
+    # DQN-only components stay None for plain Q-learning, which bootstraps
+    # from the network being trained
+    dqn_cfg = cfg if isinstance(cfg, DQNConfig) else None
+    replay_buffer = None
+    target_network = q_network
+    if dqn_cfg:
+        target_network = copy.deepcopy(q_network).requires_grad_(False)
+        obs_shape = envs.single_observation_space.shape
+        assert obs_shape is not None
+        replay_buffer = utils.ReplayBuffer(dqn_cfg.buffer_size, obs_shape)
 
-    logger.info(
-        f"Start Q Learning | env={ENV_ID} num_envs={num_envs} device={device} "
-        f"seed={seed} capture_video={capture_video}"
-    )
-    logger.info(
-        f"Hyperparameters | lr={lr:g} eps={eps_start:g}->{eps_end:g} "
-        f"(over {exploration_fraction:.0%} of steps) gamma={gamma:g} "
-        f"time_steps={time_steps}"
-    )
-    logger.debug(f"Q network:\n{q_network}")
-
-    # start
-    episode_returns, losses, step_rewards = [], [], []
-    start_time = time.time()
-    obs, _ = envs.reset(seed=seed)
-    # with NEXT_STEP autoreset, the step after an episode ends only resets
-    # that env, so its transition is not a real one and is skipped
-    autoreset = np.zeros(num_envs, dtype=bool)
-
-    step = 0
-    for step in range(1, time_steps + 1):
-        eps = linear_schedule(
-            eps_start, eps_end, exploration_fraction * time_steps, step - 1
+    def to_tensors(*arrays, dtypes) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            torch.as_tensor(x, dtype=dtype, device=device)
+            for x, dtype in zip(arrays, dtypes)
         )
 
-        # epsilon-greedy, decided per env
-        obs_t = to_tensor(obs)
-        with torch.no_grad():
-            greedy_actions = q_network(obs_t).argmax(dim=1).cpu().numpy()
-        explore = np.random.random(num_envs) < eps
-        actions = np.where(explore, envs.action_space.sample(), greedy_actions)
+    # dtypes of (obs, actions, rewards, next_obs, terminateds)
+    batch_dtypes = (
+        torch.float32,
+        torch.long,
+        torch.float32,
+        torch.float32,
+        torch.float32,
+    )
+
+    logger.info(f"Start {cfg.name} | env={ENV_ID} device={device}")
+    logger.info(f"Config | {cfg}")
+    logger.debug(f"Q network:\n{q_network}")
+
+    stats = TrainingStats(cfg.num_envs, cfg.return_window)
+    obs, _ = envs.reset(seed=cfg.seed)
+    # with NEXT_STEP autoreset, the step after an episode ends only resets
+    # that env, so its transition is not a real one and is skipped
+    autoreset = np.zeros(cfg.num_envs, dtype=bool)
+
+    step = 0
+    for step in range(1, cfg.time_steps + 1):
+        eps = linear_schedule(
+            cfg.eps_start,
+            cfg.eps_end,
+            cfg.exploration_fraction * cfg.time_steps,
+            step - 1,
+        )
+        (obs_t,) = to_tensors(obs, dtypes=(torch.float32,))
+        actions = select_actions(q_network, obs_t, eps, envs.action_space)
         next_obs, rewards, terminateds, truncateds, infos = envs.step(actions)
+        stats.record_episodes(step, infos)
 
-        if "episode" in infos:
-            returns = infos["episode"]["r"][infos["_episode"]].tolist()
-            episode_returns.extend(returns)
-            logger.debug(f"Step {step} | finished episode returns={returns}")
-
-        # one TD(0) update on the valid transitions
         valid = ~autoreset
-        if valid.any():
-            step_rewards.append(rewards[valid].mean())
+        stats.record_rewards(rewards[valid])
 
-            q = q_network(obs_t[valid])
-            q = q.gather(1, to_tensor(actions[valid], torch.long).unsqueeze(1))
-            with torch.no_grad():
-                next_q = q_network(to_tensor(next_obs[valid])).max(dim=1).values
-                not_done = 1 - to_tensor(terminateds[valid])
-                target = to_tensor(rewards[valid]) + gamma * not_done * next_q
+        batch = None
+        if dqn_cfg and replay_buffer:
+            replay_buffer.add_batch(
+                obs[valid],
+                actions[valid],
+                rewards[valid],
+                next_obs[valid],
+                terminateds[valid],
+            )
+            if step > dqn_cfg.learning_starts and step % dqn_cfg.train_frequency == 0:
+                batch = to_tensors(
+                    *replay_buffer.sample(dqn_cfg.batch_size), dtypes=batch_dtypes
+                )
+        elif valid.any():
+            # reuse obs already on the device
+            batch = (obs_t[valid],) + to_tensors(
+                actions[valid],
+                rewards[valid],
+                next_obs[valid],
+                terminateds[valid],
+                dtypes=batch_dtypes[1:],
+            )
 
-            loss = nn.functional.mse_loss(q.squeeze(1), target)
+        if batch is not None:
+            loss = td_loss(q_network, target_network, batch, cfg.gamma)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            losses.append(loss.item())
+            stats.record_loss(loss.item())
+
+        if dqn_cfg and step % dqn_cfg.target_update_interval == 0:
+            target_network.load_state_dict(q_network.state_dict())
 
         autoreset = terminateds | truncateds
         obs = next_obs
 
-        if step % log_interval == 0:
-            sps = int(step * num_envs / (time.time() - start_time))
-            logger.info(
-                f"Step {step}/{time_steps} | episodes={len(episode_returns)} | "
-                f"mean_return(last {return_window})="
-                f"{fmt_mean(episode_returns[-return_window:])} | "
-                f"mean_reward={fmt_mean(step_rewards, 3)} | "
-                f"mean_loss={fmt_mean(losses[-log_interval:], 4)} | "
-                f"eps={eps:.3f} | SPS={sps}"
-            )
-            step_rewards.clear()
+        if step % cfg.log_interval == 0:
+            stats.log(step, cfg.time_steps, eps)
 
-        if len(episode_returns) >= 10 and min(episode_returns[-10:]) >= 500:
+        if stats.solved():
             logger.info(f"Solved at step {step}: last 10 episodes reached 500")
             break
 
     envs.close()
-    logger.info(
-        f"Finished Q Learning | steps={step} episodes={len(episode_returns)} "
-        f"best_return={max(episode_returns, default='n/a')} "
-        f"mean_return(last {return_window})="
-        f"{fmt_mean(episode_returns[-return_window:])} | "
-        f"elapsed={time.time() - start_time:.1f}s"
-    )
+    stats.summary(cfg.name, step)
+    utils.save_model(q_network, cfg.name)
+    return q_network
 
-    logger.info("Saving model weight")
-    utils.save_model(q_network, "q_network")
+
+def q_learning():
+    utils.setup_logging()
+    train(QLearningConfig())
+
+
+def dqn():
+    utils.setup_logging()
+    train(DQNConfig())

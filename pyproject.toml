@@ -12,9 +12,10 @@ dependencies = [
 
 [project.scripts]
 rl = "rl:main"
-basics-single-env = "rl.basics.main:single_env"
-basics-multi-envs = "rl.basics.main:multi_env"
+basics-single-env = "rl.basics.demos:single_env"
+basics-multi-envs = "rl.basics.demos:multi_env"
 basics-q-learning = "rl.basics.main:q_learning"
+basics-dqn = "rl.basics.main:dqn"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]
